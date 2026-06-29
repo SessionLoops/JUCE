@@ -90,6 +90,11 @@ static_assert (AAX_SDK_CURRENT_REVISION >= AAX_SDK_2p6p1_REVISION, "JUCE require
 #include <AAX_Assert.h>
 #include <AAX_TransportTypes.h>
 
+#if JucePlugin_Enable_ARA
+#include <NonPublic/ARA/ARAAAX.h>
+#include <NonPublic/ARA/AAX_VARABinding.h>
+#endif
+
 JUCE_END_IGNORE_WARNINGS_MSVC
 JUCE_END_IGNORE_WARNINGS_GCC_LIKE
 
@@ -646,7 +651,7 @@ namespace AAXClasses
                 setOpaque (true);
                 setBroughtToFrontOnMouseClick (true);
 
-                pluginEditor.reset (plugin.createEditorAndMakeActive());
+                pluginEditor.reset (plugin.createEditorIfNeeded());
                 addAndMakeVisible (pluginEditor.get());
 
                 if (pluginEditor != nullptr)
@@ -692,6 +697,14 @@ namespace AAXClasses
             void mouseDown (const MouseEvent& e) override  { callMouseMethod (e, &AAX_IViewContainer::HandleParameterMouseDown); }
             void mouseUp   (const MouseEvent& e) override  { callMouseMethod (e, &AAX_IViewContainer::HandleParameterMouseUp); }
             void mouseDrag (const MouseEvent& e) override  { callMouseMethod (e, &AAX_IViewContainer::HandleParameterMouseDrag); }
+
+           #if JucePlugin_Enable_ARA
+            void resized() override
+            {
+                if (pluginEditor != nullptr)
+                    pluginEditor->setBounds (getLocalBounds());
+            }
+           #endif
 
             void parentSizeChanged() override
             {
@@ -817,6 +830,14 @@ namespace AAXClasses
             return new JuceAAX_Processor();
         }
 
+       #if JucePlugin_Enable_ARA
+    	AAX_Result Initialize (IACFUnknown* iController) override
+        {
+        	aaxaraBinding.reset (new ARA::AAX_VARABinding (iController));
+            return AAX_CEffectParameters::Initialize (iController);
+        }
+       #endif
+
         AAX_Result Uninitialize() override
         {
             cancelPendingUpdate();
@@ -836,6 +857,36 @@ namespace AAXClasses
         AAX_Result EffectInit() override
         {
             cancelPendingUpdate();
+
+           #if JucePlugin_Enable_ARA
+	        ARA::ARAPlugInInstanceRoleFlags knownRoles = 0;
+	        auto result = aaxaraBinding->GetInstanceRoleFlags (&knownRoles, &assignedRoles);
+	
+	        // If no ARA roles provided - work as a regular AAX plug-in
+	        if (result == AAX_SUCCESS)
+	        {
+		        assignedRoles &= (ARA::kARAPlaybackRendererRole | ARA::kARAEditorRendererRole | ARA::kARAEditorViewRole);
+		        if (assignedRoles)
+		        {
+			        result = aaxaraBinding->GetDocumentController (&documentControllerRef);
+			        if (result != AAX_SUCCESS)
+				        return result;
+
+			        auto araPluginExtension = dynamic_cast<AudioProcessorARAExtension*> (pluginInstance.get());
+			        if (!araPluginExtension)
+				        return AAX_ERROR_NULL_OBJECT;
+
+			        auto* const plugInEnxtensionInstance = araPluginExtension->bindToARA (documentControllerRef, knownRoles, assignedRoles);
+			        if (!plugInEnxtensionInstance)
+				        return AAX_ERROR_NULL_OBJECT;
+			
+			        result = aaxaraBinding->SetPlugInExtensionInstance (plugInEnxtensionInstance);
+			        if (result != AAX_SUCCESS)
+				        return result;
+		        }
+	        }
+           #endif      
+
             check (Controller()->GetSampleRate (&sampleRate));
             processingSidechainChange = false;
             auto err = preparePlugin();
@@ -931,7 +982,7 @@ namespace AAXClasses
                     auto numObjects = dataSize / sizeof (PluginInstanceInfo);
                     auto* objects = static_cast<PluginInstanceInfo*> (data);
 
-                    jassert (numObjects == 1); // not sure how to handle more than one
+                    jassert (numObjects == 1); // not sure how to handle more than one..
 
                     for (size_t i = 0; i < numObjects; ++i)
                         new (objects + i) PluginInstanceInfo (const_cast<JuceAAX_Processor&> (*this));
@@ -2279,6 +2330,12 @@ namespace AAXClasses
             std::atomic<int> state { 0 };
         };
 
+       #if JucePlugin_Enable_ARA
+        std::unique_ptr<ARA::AAX_VARABinding> aaxaraBinding;
+	    ARA::ARADocumentControllerRef documentControllerRef;
+	    ARA::ARAPlugInInstanceRoleFlags assignedRoles;
+       #endif
+
         RecordingState recordingState;
 
         std::atomic<bool> processingSidechainChange, sidechainDesired;
@@ -2414,6 +2471,9 @@ namespace AAXClasses
             aaxInputFormat = aaxOutputFormat;
        #endif
 
+        if (processor.isMidiEffect())
+            aaxInputFormat = aaxOutputFormat = AAX_eStemFormat_Mono;
+
         check (desc.AddAudioIn  (JUCEAlgorithmIDs::inputChannels));
         check (desc.AddAudioOut (JUCEAlgorithmIDs::outputChannels));
 
@@ -2481,7 +2541,7 @@ namespace AAXClasses
 
         properties->AddProperty (AAX_eProperty_PlugInID_Native, pluginID);
 
-       #if ! JucePlugin_AAXDisableAudioSuite
+       #if ! (JucePlugin_AAXDisableAudioSuite || JucePlugin_Enable_ARA)
         properties->AddProperty (AAX_eProperty_PlugInID_AudioSuite,
                                  extensions.getPluginIDForMainBusConfig (fullLayout.getMainInputChannelSet(),
                                                                          fullLayout.getMainOutputChannelSet(),
@@ -2543,6 +2603,13 @@ namespace AAXClasses
             }
         }
 
+       #if JucePlugin_Enable_ARA
+        properties->AddProperty (AAX_eProperty_ShowInMenus, false);
+	    properties->AddProperty (AAX_eProperty_UsesTransport, true);
+        properties->AddProperty (AAX_eProperty_Constraint_Topology, AAX_eConstraintTopology_Monolithic);
+        properties->AddPointerProperty (ARA::AAX_eProperty_ARAFactoryPointer, createARAFactory());
+       #endif
+
         check (desc.AddProcessProc_Native (algorithmProcessCallback, properties));
     }
 
@@ -2583,16 +2650,10 @@ namespace AAXClasses
             // MIDI effect plug-ins do not support any audio channels
             jassert (numInputBuses == 0 && numOutputBuses == 0);
 
-            for (const auto format : aaxFormats)
+            if (auto* desc = descriptor.NewComponentDescriptor())
             {
-                const auto channelSet = channelSetFromStemFormat (format, false);
-                const AudioProcessor::BusesLayout layout { { channelSet }, { channelSet } };
-
-                if (auto* desc = descriptor.NewComponentDescriptor())
-                {
-                    createDescriptor (*desc, layout, *plugin, pluginIds, numMeters);
-                    check (descriptor.AddComponent (desc));
-                }
+                createDescriptor (*desc, plugin->getBusesLayout(), *plugin, pluginIds, numMeters);
+                check (descriptor.AddComponent (desc));
             }
         }
         else
@@ -2634,6 +2695,35 @@ void AAX_CALLBACK AAXClasses::algorithmProcessCallback (JUCEAlgorithmContext* co
     AAXClasses::JuceAAX_Processor::algorithmCallback (instancesBegin, instancesEnd);
 }
 
+static bool HostDeclaresARASupport(AAX_ICollection* inCollection)
+{
+	bool result = false;
+	const AAX_IDescriptionHost* const hostDesc = inCollection->DescriptionHost();
+	if (hostDesc)
+	{
+		std::unique_ptr<const AAX_IFeatureInfo> featureInfo(hostDesc->AcquireFeatureProperties(AAXATTR_ClientFeature_ARA));
+		if (featureInfo)
+		{
+			AAX_ESupportLevel featureSupportLevel = AAX_eSupportLevel_Uninitialized;
+			const AAX_Result err = featureInfo->SupportLevel(featureSupportLevel);
+			AAX_TRACE_RELEASE(kAAX_Trace_Priority_Normal, "ARA initialization: host support for ARA: %s, err: %ld",
+			                    AAX::AsStringSupportLevel(featureSupportLevel).c_str(), (long int)err);
+			result = (err == AAX_SUCCESS) && (featureSupportLevel == AAX_eSupportLevel_Supported);
+		}
+		else
+		{
+			AAX_TRACE_RELEASE(kAAX_Trace_Priority_Normal, "ARA initialization: Unable to query AAXATTR_ClientFeature_ARA");
+			result = false;
+		}
+	}
+	else
+	{
+		AAX_TRACE_RELEASE(kAAX_Trace_Priority_High, "ARA initialization: AAX_IDescriptionHost is null");
+		result = false;
+	}
+	return result;
+}
+
 //==============================================================================
 AAX_Result JUCE_CDECL GetEffectDescriptions (AAX_ICollection*);
 AAX_Result JUCE_CDECL GetEffectDescriptions (AAX_ICollection* collection)
@@ -2647,6 +2737,11 @@ AAX_Result JUCE_CDECL GetEffectDescriptions (AAX_ICollection* collection)
 
     if (auto* descriptor = collection->NewDescriptor())
     {
+       #if JucePlugin_Enable_ARA
+        if (!HostDeclaresARASupport(collection))
+	        return AAX_SUCCESS;
+       #endif
+
         AAXClasses::getPlugInDescription (*descriptor, stemFormatFeatureInfo.get());
         collection->AddEffect (JUCE_STRINGIFY (JucePlugin_AAXIdentifier), descriptor);
 
