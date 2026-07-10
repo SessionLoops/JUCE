@@ -57,6 +57,7 @@ JUCE_BEGIN_NO_SANITIZE ("vptr")
 #include <juce_audio_plugin_client/detail/juce_CheckSettingMacros.h>
 #include <juce_audio_plugin_client/detail/juce_IncludeSystemHeaders.h>
 #include <juce_audio_plugin_client/detail/juce_PluginUtilities.h>
+#include <juce_audio_plugin_client/detail/juce_PluginScaleFactorUtilities.h>
 #include <juce_audio_plugin_client/detail/juce_LinuxMessageThread.h>
 #include <juce_audio_plugin_client/detail/juce_VSTWindowUtilities.h>
 #include <juce_gui_basics/native/juce_WindowsHooks_windows.h>
@@ -119,11 +120,6 @@ namespace juce
 {
 
 using namespace Steinberg;
-
-//==============================================================================
-#if JUCE_WINDOWS && JUCE_WIN_PER_MONITOR_DPI_AWARE
- double getScaleFactorForWindow (HWND);
-#endif
 
 //==============================================================================
 #if JUCE_LINUX || JUCE_BSD
@@ -1180,7 +1176,9 @@ public:
     Steinberg::TBool PLUGIN_API isViewEmbeddingSupported() override
     {
         if (auto* pluginInstance = getPluginInstance())
-            return (Steinberg::TBool) dynamic_cast<AudioProcessorARAExtension*> (pluginInstance)->isEditorView();
+            if (auto* extension = pluginInstance->getARAClientExtensions())
+                return (Steinberg::TBool) extension->isEditorView();
+
         return (Steinberg::TBool) false;
     }
 
@@ -1542,7 +1540,14 @@ public:
             auto latencySamples = pluginInstance->getLatencySamples();
 
            #if JucePlugin_Enable_ARA
-            jassert (latencySamples == 0 || ! dynamic_cast<AudioProcessorARAExtension*> (pluginInstance)->isBoundToARA());
+            jassert (latencySamples == 0 || std::invoke ([&]
+            {
+                if (auto* extension = pluginInstance->getARAClientExtensions())
+                    return ! extension->isBoundToARA();
+
+                jassertfalse;
+                return false;
+            }));
            #endif
 
             if (details.latencyChanged && latencySamples != lastLatencySamples)
@@ -1672,9 +1677,7 @@ private:
     int lastLatencySamples = 0;
     bool blueCatPatchwork = isBlueCatHost (hostContext.get());
 
-   #if ! JUCE_MAC
-    float lastScaleFactorReceived = 1.0f;
-   #endif
+    detail::PluginScaleFactorManager scaleManager;
 
     InterfaceResultWithDeferredAddRef queryInterfaceInternal (const TUID targetIID)
     {
@@ -1946,12 +1949,8 @@ private:
 
         ~JuceVST3Editor() override = default; // NOLINT
 
-        //==============================================================================
-        // PitchNet patch: forward Command-key shortcuts that ARA/VST3 hosts (e.g.
-        // REAPER, Cubase) otherwise swallow before they reach the plugin. JUCE does
-        // not implement IPlugView::onKeyDown for its VST3 editor, so the host treats
-        // those keys as unhandled and runs its own action (e.g. host undo on Cmd+Z).
-        // See https://forum.juce.com/t/vst3-keystroke-handling/49765
+        // Forward command-key shortcuts that VST3 hosts may otherwise consume
+        // before they reach the embedded editor.
         tresult PLUGIN_API onKeyDown (char16 key, int16 keyCode, int16 modifiers) override
         {
             if (component == nullptr)
@@ -1963,28 +1962,25 @@ private:
 
             const auto mods = vst3ModifiersToJuce (modifiers);
 
-            // Only recover shortcuts that use the command modifier; everything else
-            // already reaches the plugin through the normal JUCE keyboard path.
             if ((mods.getRawFlags() & ModifierKeys::commandModifier) == 0)
                 return kResultFalse;
 
-            // Command shortcuts are character keys, so keyCode (a virtual key) is 0.
+            // Command shortcuts are character keys, so keyCode is zero.
             if (keyCode != 0 || key == 0)
                 return kResultFalse;
 
-            int juceKeyCode = (int) key;
+            auto juceKeyCode = (int) key;
             if (juceKeyCode >= 'A' && juceKeyCode <= 'Z')
                 juceKeyCode += ('a' - 'A');
 
-            const KeyPress kp (juceKeyCode, mods, (juce_wchar) key);
-            return peer->handleKeyPress (kp) ? kResultTrue : kResultFalse;
+            const KeyPress keyPress (juceKeyCode, mods, (juce_wchar) key);
+            return peer->handleKeyPress (keyPress) ? kResultTrue : kResultFalse;
         }
 
         tresult PLUGIN_API onKeyUp (char16 key, int16 keyCode, int16 modifiers) override
         {
-            // Swallow the key-up for command shortcuts we handle on key-down so the
-            // host does not act on it a second time.
             const auto mods = vst3ModifiersToJuce (modifiers);
+
             if ((mods.getRawFlags() & ModifierKeys::commandModifier) != 0
                 && keyCode == 0 && key != 0)
                 return kResultTrue;
@@ -1994,18 +1990,16 @@ private:
 
         static ModifierKeys vst3ModifiersToJuce (int16 modifiers) noexcept
         {
-            // VST3 KeyModifier bit values (from pluginterfaces/base/keycodes.h, which
-            // is not bundled with the trimmed JUCE VST3 SDK).
-            constexpr int kVstShiftKey     = 1 << 0;
-            constexpr int kVstAlternateKey = 1 << 1;
-            constexpr int kVstCommandKey   = 1 << 2;
-            constexpr int kVstControlKey   = 1 << 3;
+            constexpr int vstShiftKey     = 1 << 0;
+            constexpr int vstAlternateKey = 1 << 1;
+            constexpr int vstCommandKey   = 1 << 2;
+            constexpr int vstControlKey   = 1 << 3;
 
             int flags = 0;
-            if (modifiers & kVstShiftKey)     flags |= ModifierKeys::shiftModifier;
-            if (modifiers & kVstAlternateKey) flags |= ModifierKeys::altModifier;
-            if (modifiers & kVstCommandKey)   flags |= ModifierKeys::commandModifier;
-            if (modifiers & kVstControlKey)   flags |= ModifierKeys::ctrlModifier;
+            if (modifiers & vstShiftKey)     flags |= ModifierKeys::shiftModifier;
+            if (modifiers & vstAlternateKey) flags |= ModifierKeys::altModifier;
+            if (modifiers & vstCommandKey)   flags |= ModifierKeys::commandModifier;
+            if (modifiers & vstControlKey)   flags |= ModifierKeys::ctrlModifier;
 
             return ModifierKeys (flags);
         }
@@ -2059,27 +2053,9 @@ private:
             const auto desktopFlags = detail::PluginUtilities::getDesktopFlags (component->pluginEditor.get());
 
            #if JUCE_WINDOWS || JUCE_LINUX || JUCE_BSD
-            // If the plugin was last opened at a particular scale, try to reapply that scale here.
-            // Note that we do this during attach(), rather than in JuceVST3Editor(). During the
-            // constructor, we don't have a host plugFrame, so
-            // ContentWrapperComponent::resizeHostWindow() won't do anything, and the content
-            // wrapper component will be left at the wrong size.
-            applyScaleFactor (StoredScaleFactor{}.withInternal (owner->lastScaleFactorReceived));
-
-            // Check the host scale factor *before* calling addToDesktop, so that the initial
-            // window size during addToDesktop is correct for the current platform scale factor.
-            #if JUCE_WINDOWS && JUCE_WIN_PER_MONITOR_DPI_AWARE
-             component->checkHostWindowScaleFactor();
-            #endif
-
             component->setOpaque (true);
             component->addToDesktop (desktopFlags, systemWindow);
             component->setVisible (true);
-
-            #if JUCE_WINDOWS && JUCE_WIN_PER_MONITOR_DPI_AWARE
-             component->startTimer (500);
-            #endif
-
            #else
             macHostWindow = detail::VSTWindowUtilities::attachComponentToWindowRefVST (component.get(), desktopFlags, parent);
            #endif
@@ -2126,12 +2102,12 @@ private:
             }
 
             lastReportedSize.reset();
-            rect = roundToViewRect (convertFromHostBounds (*newSize));
 
             if (component == nullptr)
                 return kResultTrue;
 
-            component->setSize (rect.getWidth(), rect.getHeight());
+            const auto rounded = owner->scaleManager.convertFromHostBounds (createRectangle (*newSize)).toNearestIntEdges();
+            component->onSize (rounded.getWidth(), rounded.getHeight());
 
            #if JUCE_MAC
             if (cubase10Workaround != nullptr)
@@ -2142,7 +2118,11 @@ private:
            #endif
             {
                 if (auto* peer = component->getPeer())
-                    peer->updateBounds();
+                {
+                    peer->setBounds ((Rectangle { newSize->getWidth(), newSize->getHeight() }.toFloat()
+                                         / peer->getPlatformScaleFactor()).toNearestInt(),
+                                     false);
+                }
             }
 
             return kResultTrue;
@@ -2155,15 +2135,12 @@ private:
                 return kResultFalse;
            #endif
 
-            if (size == nullptr || component == nullptr)
+            if (size == nullptr || component == nullptr || component->pluginEditor == nullptr)
                 return kResultFalse;
 
             const auto editorBounds = component->getSizeToContainChild();
-            const auto sizeToReport = lastReportedSize.has_value()
-                                    ? *lastReportedSize
-                                    : convertToHostBounds (editorBounds.withZeroOrigin().toFloat());
 
-            lastReportedSize = *size = sizeToReport;
+            lastReportedSize = *size = lastReportedSize.value_or (createViewRect (owner->scaleManager.convertToHostBounds (editorBounds.withZeroOrigin().toFloat())));
             return kResultTrue;
         }
 
@@ -2191,14 +2168,14 @@ private:
                         auto constrainedRect = component->getLocalArea (editor, editor->getLocalBounds())
                                                         .getSmallestIntegerContainer();
 
-                        *rectToCheck = roundToViewRect (convertFromHostBounds (*rectToCheck));
+                        *rectToCheck = createViewRect (owner->scaleManager.convertFromHostBounds (createRectangle (*rectToCheck)).toNearestIntEdges());
                         rectToCheck->right  = rectToCheck->left + roundToInt (constrainedRect.getWidth());
                         rectToCheck->bottom = rectToCheck->top  + roundToInt (constrainedRect.getHeight());
-                        *rectToCheck = convertToHostBounds (createRectangle (*rectToCheck));
+                        *rectToCheck = createViewRect (owner->scaleManager.convertToHostBounds (createRectangle (*rectToCheck).toFloat()));
                     }
                     else if (auto* constrainer = editor->getConstrainer())
                     {
-                        const auto clientBounds = convertFromHostBounds (*rectToCheck);
+                        const auto clientBounds = owner->scaleManager.convertFromHostBounds (createRectangle (*rectToCheck));
                         const auto editorBounds = editor->getLocalArea (component.get(), clientBounds);
 
                         auto minW = (float) constrainer->getMinimumWidth();
@@ -2249,8 +2226,8 @@ private:
 
                         auto constrainedRect = component->getLocalArea (editor, Rectangle<float> (width, height));
 
-                        *rectToCheck = convertToHostBounds (clientBounds.withWidth (constrainedRect.getWidth())
-                                                                        .withHeight (constrainedRect.getHeight()));
+                        *rectToCheck = createViewRect (owner->scaleManager.convertToHostBounds (clientBounds.withWidth (constrainedRect.getWidth())
+                                                                                                            .withHeight (constrainedRect.getHeight())));
                     }
                 }
 
@@ -2264,14 +2241,14 @@ private:
         tresult PLUGIN_API setContentScaleFactor ([[maybe_unused]] const IPlugViewContentScaleSupport::ScaleFactor factor) override
         {
            #if ! JUCE_MAC
-            const auto scaleToApply = [&]
+            const auto scaleToApply = std::invoke ([&]
             {
                #if JUCE_WINDOWS && JUCE_WIN_PER_MONITOR_DPI_AWARE
                 // Cubase 10 only sends integer scale factors, so correct this for fractional scales
                 if (detail::PluginUtilities::getHostType().type != PluginHostType::SteinbergCubase10)
                     return factor;
 
-                const auto hostWindowScale = (IPlugViewContentScaleSupport::ScaleFactor) getScaleFactorForWindow (static_cast<HWND> (systemWindow));
+                const auto hostWindowScale = (decltype (factor)) detail::PluginScaleFactorManager::getScaleFactorForWindow (static_cast<HWND> (systemWindow));
 
                 if (hostWindowScale <= 0.0 || approximatelyEqual (factor, hostWindowScale))
                     return factor;
@@ -2280,9 +2257,9 @@ private:
                #else
                 return factor;
                #endif
-            }();
+            });
 
-            applyScaleFactor (scaleFactor.withHost (scaleToApply));
+            owner->scaleManager.setHostScale (scaleToApply);
 
             return kResultTrue;
            #else
@@ -2341,53 +2318,36 @@ private:
             onSize (&viewRect);
         }
 
-        static ViewRect roundToViewRect (Rectangle<float> r)
+        static ViewRect createViewRect (Rectangle<int> r)
         {
-            const auto rounded = r.toNearestIntEdges();
-            return { rounded.getX(),
-                     rounded.getY(),
-                     rounded.getRight(),
-                     rounded.getBottom() };
+            return { r.getX(), r.getY(), r.getRight(), r.getBottom() };
         }
 
-        static Rectangle<float> createRectangle (ViewRect viewRect)
+        static Rectangle<int> createRectangle (ViewRect viewRect)
         {
-            return Rectangle<float>::leftTopRightBottom ((float) viewRect.left,
-                                                         (float) viewRect.top,
-                                                         (float) viewRect.right,
-                                                         (float) viewRect.bottom);
-        }
-
-        static ViewRect convertToHostBounds (Rectangle<float> pluginRect)
-        {
-            const auto desktopScale = Desktop::getInstance().getGlobalScaleFactor();
-            return roundToViewRect (approximatelyEqual (desktopScale, 1.0f) ? pluginRect
-                                                                            : pluginRect * desktopScale);
-        }
-
-        static Rectangle<float> convertFromHostBounds (ViewRect hostViewRect)
-        {
-            const auto desktopScale = Desktop::getInstance().getGlobalScaleFactor();
-            const auto hostRect = createRectangle (hostViewRect);
-
-            return approximatelyEqual (desktopScale, 1.0f) ? hostRect
-                                                           : (hostRect / desktopScale);
+            return Rectangle<int>::leftTopRightBottom ((int) viewRect.left,
+                                                       (int) viewRect.top,
+                                                       (int) viewRect.right,
+                                                       (int) viewRect.bottom);
         }
 
         //==============================================================================
-        struct ContentWrapperComponent final : public Component
-                                            #if JUCE_WINDOWS && JUCE_WIN_PER_MONITOR_DPI_AWARE
-                                             , public Timer
-                                            #endif
+        struct ContentWrapperComponent final : public Component,
+                                               private detail::PluginScaleFactorManagerListener
         {
             ContentWrapperComponent (JuceVST3Editor& editor)  : owner (editor)
             {
                 setOpaque (true);
                 setBroughtToFrontOnMouseClick (true);
+                owner.owner->scaleManager.addListener (*this);
+                owner.owner->scaleManager.startObserving (*this);
             }
 
             ~ContentWrapperComponent() override
             {
+                owner.owner->scaleManager.stopObserving (*this);
+                owner.owner->scaleManager.removeListener (*this);
+
                 if (pluginEditor != nullptr)
                 {
                     PopupMenu::dismissAllActiveMenus();
@@ -2397,10 +2357,10 @@ private:
 
             void createEditor (AudioProcessor& plugin)
             {
-                pluginEditor.reset (plugin.createEditorIfNeeded());
+                pluginEditor.reset (plugin.createEditorAndMakeActive());
 
                #if JucePlugin_Enable_ARA
-                jassert (dynamic_cast<AudioProcessorEditorARAExtension*> (pluginEditor.get()) != nullptr);
+                jassert (pluginEditor->getARAClientExtensions() != nullptr);
                 // for proper view embedding, ARA plug-ins must be resizable
                 jassert (pluginEditor->isResizable());
                #endif
@@ -2413,25 +2373,17 @@ private:
                                                                              &owner);
 
                     pluginEditor->setHostContext (editorHostContext.get());
-                   #if ! JUCE_MAC
-                    pluginEditor->setScaleFactor (owner.scaleFactor.get());
-                   #endif
 
                     addAndMakeVisible (pluginEditor.get());
                     pluginEditor->setTopLeftPosition (0, 0);
 
-                    lastBounds = getSizeToContainChild();
-
-                    {
-                        const ScopedValueSetter<bool> resizingParentSetter (resizingParent, true);
-                        setBounds (lastBounds);
-                    }
+                    setBounds (getSizeToContainChild());
 
                     resizeHostWindow();
                 }
                 else
                 {
-                    // if hasEditor() returns true then createEditorIfNeeded has to return a valid editor
+                    // if hasEditor() returns true then createEditor() has to return a valid editor
                     jassertfalse;
                 }
             }
@@ -2441,7 +2393,7 @@ private:
                 g.fillAll (Colours::black);
             }
 
-            juce::Rectangle<int> getSizeToContainChild()
+            Rectangle<int> getSizeToContainChild()
             {
                 if (pluginEditor != nullptr)
                     return getLocalArea (pluginEditor.get(), pluginEditor->getLocalBounds());
@@ -2449,42 +2401,28 @@ private:
                 return {};
             }
 
+            void onSize (int w, int h)
+            {
+                const ScopedValueSetter resizingChildSetter (resizingChild, true);
+
+                if (pluginEditor != nullptr)
+                {
+                    const auto editorArea = pluginEditor->getLocalArea (this, Rectangle { w, h });
+                    pluginEditor->setBoundsConstrained (editorArea.withZeroOrigin());
+                }
+            }
+
             void childBoundsChanged (Component*) override
             {
                 if (resizingChild)
                     return;
 
-                auto newBounds = getSizeToContainChild();
+                resizeHostWindow();
 
-                if (newBounds != lastBounds)
-                {
-                    resizeHostWindow();
-
-                   #if JUCE_LINUX || JUCE_BSD
-                    if (detail::PluginUtilities::getHostType().isBitwigStudio())
-                        repaint();
-                   #endif
-
-                    lastBounds = newBounds;
-                }
-            }
-
-            void resized() override
-            {
-                if (pluginEditor != nullptr)
-                {
-                    if (! resizingParent)
-                    {
-                        auto newBounds = getLocalBounds();
-
-                        {
-                            const ScopedValueSetter<bool> resizingChildSetter (resizingChild, true);
-                            pluginEditor->setBounds (pluginEditor->getLocalArea (this, newBounds).withZeroOrigin());
-                        }
-
-                        lastBounds = newBounds;
-                    }
-                }
+               #if JUCE_LINUX || JUCE_BSD
+                if (detail::PluginUtilities::getHostType().isBitwigStudio())
+                    repaint();
+               #endif
             }
 
             void parentSizeChanged() override
@@ -2503,13 +2441,9 @@ private:
                     if (owner.plugFrame != nullptr)
                     {
                         auto editorBounds = getSizeToContainChild();
-                        auto newSize = convertToHostBounds (editorBounds.withZeroOrigin().toFloat());
+                        auto newSize = owner.createViewRect (owner.owner->scaleManager.convertToHostBounds (editorBounds.withZeroOrigin().toFloat()));
 
-                        {
-                            const ScopedValueSetter<bool> resizingParentSetter (resizingParent, true);
-                            owner.plugFrame->resizeView (&owner, &newSize);
-                        }
-
+                        owner.plugFrame->resizeView (&owner, &newSize);
                         auto host = detail::PluginUtilities::getHostType();
 
                        #if JUCE_MAC
@@ -2522,48 +2456,17 @@ private:
                 }
             }
 
-            void setEditorScaleFactor (float scale)
-            {
-                if (pluginEditor != nullptr)
-                {
-                    auto prevEditorBounds = pluginEditor->getLocalArea (this, lastBounds);
-
-                    {
-                        const ScopedValueSetter<bool> resizingChildSetter (resizingChild, true);
-
-                        pluginEditor->setScaleFactor (scale);
-                        pluginEditor->setBounds (prevEditorBounds.withZeroOrigin());
-                    }
-
-                    lastBounds = getSizeToContainChild();
-
-                    resizeHostWindow();
-                    repaint();
-                }
-            }
-
-           #if JUCE_WINDOWS && JUCE_WIN_PER_MONITOR_DPI_AWARE
-            void checkHostWindowScaleFactor()
-            {
-                const auto estimatedScale = (float) getScaleFactorForWindow (static_cast<HWND> (owner.systemWindow));
-
-                if (estimatedScale > 0.0)
-                    owner.applyScaleFactor (owner.scaleFactor.withInternal (estimatedScale));
-            }
-
-            void timerCallback() override
-            {
-                checkHostWindowScaleFactor();
-            }
-           #endif
-
             std::unique_ptr<AudioProcessorEditor> pluginEditor;
 
         private:
+            void peerBoundsDidUpdate() override
+            {
+                resizeHostWindow();
+            }
+
             JuceVST3Editor& owner;
             std::unique_ptr<EditorHostContext> editorHostContext;
-            Rectangle<int> lastBounds;
-            bool resizingChild = false, resizingParent = false;
+            bool resizingChild = false;
 
             JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ContentWrapperComponent)
         };
@@ -2626,44 +2529,8 @@ private:
         };
 
         std::unique_ptr<Cubase10WindowResizeWorkaround> cubase10Workaround;
-       #else
-        class StoredScaleFactor
-        {
-        public:
-            StoredScaleFactor withHost     (float x) const { return withMember (*this, &StoredScaleFactor::host,     x); }
-            StoredScaleFactor withInternal (float x) const { return withMember (*this, &StoredScaleFactor::internal, x); }
-            float get() const { return host.value_or (internal); }
-
-        private:
-            std::optional<float> host;
-            float internal = 1.0f;
-        };
-
-        void applyScaleFactor (const StoredScaleFactor newFactor)
-        {
-            const auto previous = std::exchange (scaleFactor, newFactor).get();
-
-            if (approximatelyEqual (previous, scaleFactor.get()))
-                return;
-
-            if (owner != nullptr)
-                owner->lastScaleFactorReceived = scaleFactor.get();
-
-            if (component != nullptr)
-            {
-               #if JUCE_LINUX || JUCE_BSD
-                const MessageManagerLock mmLock;
-               #endif
-                component->setEditorScaleFactor (scaleFactor.get());
-            }
-        }
-
-        StoredScaleFactor scaleFactor;
-
-        #if JUCE_WINDOWS
-         detail::WindowsHooks hooks;
-        #endif
-
+       #elif JUCE_WINDOWS
+        detail::WindowsHooks hooks;
        #endif
 
         //==============================================================================
@@ -3983,10 +3850,14 @@ private:
     }
 
     const ARA::ARAPlugInExtensionInstance* PLUGIN_API bindToDocumentControllerWithRoles (ARA::ARADocumentControllerRef documentControllerRef,
-                                                                                         ARA::ARAPlugInInstanceRoleFlags knownRoles, ARA::ARAPlugInInstanceRoleFlags assignedRoles) SMTG_OVERRIDE
+                                                                                         ARA::ARAPlugInInstanceRoleFlags knownRoles,
+                                                                                         ARA::ARAPlugInInstanceRoleFlags assignedRoles) SMTG_OVERRIDE
     {
-        AudioProcessorARAExtension* araAudioProcessorExtension = dynamic_cast<AudioProcessorARAExtension*> (pluginInstance);
-        return araAudioProcessorExtension->bindToARA (documentControllerRef, knownRoles, assignedRoles);
+        if (auto* araAudioProcessorExtension = pluginInstance->getARAClientExtensions())
+            return araAudioProcessorExtension->bindToARA (documentControllerRef, knownRoles, assignedRoles);
+
+        jassertfalse;
+        return nullptr;
     }
    #endif
 
