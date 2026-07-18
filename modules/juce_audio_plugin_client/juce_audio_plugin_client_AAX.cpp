@@ -2604,7 +2604,11 @@ namespace AAXClasses
         }
 
        #if JucePlugin_Enable_ARA
-        properties->AddProperty (AAX_eProperty_ShowInMenus, false);
+        // An ARA-capable effect may also be instantiated without any ARA roles,
+        // in which case EffectInit() deliberately runs it as a regular AAX
+        // plug-in. Keep the descriptor visible so Pro Tools can offer that
+        // regular instance in its insert menus as well as use it for ARA.
+        properties->AddProperty (AAX_eProperty_ShowInMenus, true);
 	    properties->AddProperty (AAX_eProperty_UsesTransport, true);
         properties->AddProperty (AAX_eProperty_Constraint_Topology, AAX_eConstraintTopology_Monolithic);
         properties->AddPointerProperty (ARA::AAX_eProperty_ARAFactoryPointer, createARAFactory());
