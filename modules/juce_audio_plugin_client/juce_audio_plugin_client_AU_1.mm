@@ -2008,6 +2008,9 @@ private:
         {
             int flags = 0;
 
+            if (details.tailLengthChanged)
+                flags |= tailLengthChangedFlag;
+
             if (details.latencyChanged)
                 flags |= latencyChangedFlag;
 
@@ -2033,6 +2036,9 @@ private:
         {
             const auto flags = callbackFlags.exchange (0);
 
+            if ((flags & tailLengthChangedFlag) != 0)
+                owner.PropertyChanged (kAudioUnitProperty_TailTime, kAudioUnitScope_Global, 0);
+
             if ((flags & latencyChangedFlag) != 0)
                 owner.PropertyChanged (kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0);
 
@@ -2042,7 +2048,8 @@ private:
                 owner.PropertyChanged (kAudioUnitProperty_ParameterInfo, kAudioUnitScope_Global, 0);
             }
 
-            owner.PropertyChanged (kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0);
+            if ((flags & ~tailLengthChangedFlag) != 0)
+                owner.PropertyChanged (kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0);
 
             if ((flags & programChangedFlag) != 0)
             {
@@ -2055,7 +2062,8 @@ private:
 
         static constexpr int latencyChangedFlag       = 1 << 0,
                              parameterInfoChangedFlag = 1 << 1,
-                             programChangedFlag       = 1 << 2;
+                             programChangedFlag       = 1 << 2,
+                             tailLengthChangedFlag    = 1 << 3;
 
         std::atomic<int> callbackFlags { 0 };
     };

@@ -74,6 +74,9 @@ public:
     {
         /** @see withLatencyChanged */
         bool latencyChanged           = false;
+        /** Indicates a changed tail length; currently supported by the AU wrapper. */
+        bool tailLengthChanged        = false;
+        [[nodiscard]] ChangeDetails withTailLengthChanged (bool b) const noexcept { return with (&ChangeDetails::tailLengthChanged, b); }
         /** @see withParameterInfoChanged */
         bool parameterInfoChanged     = false;
         /** @see withProgramChanged */
